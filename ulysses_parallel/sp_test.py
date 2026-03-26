@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.distributed._composable.fsdp import fully_shard
 
 from modeling_dummy import DummyModel, Attention
-from dataset_dummy import DummyDataset
+from dataset_dummy import LLMDummyDataset
 from ulysses_utils import ulysses_parellel_forward
 
 def train(args, local_rank, world_size, device_type="npu"):
@@ -22,18 +22,22 @@ def train(args, local_rank, world_size, device_type="npu"):
     hidden_size = args.hidden_size
     num_heads = args.num_heads
     torch.npu.set_device(device)
+    vocab_size = 10000
+    seq_len = 32
     if args.sp_enabled:
         Attention.forward = ulysses_parellel_forward
         print(f"====>[WARNING]: Attention.forward being replaced with ulysses_parellel_forward.", flush=True)
-    model = DummyModel(hidden_size=hidden_size, num_heads=num_heads).to(device)
     
+    # 初始化包含 Embedding 的 LLM 模型
+    model = DummyModel(vocab_size=vocab_size, hidden_size=hidden_size, num_heads=num_heads).to(device)
     
     dist.barrier()
 
     for name, module in reversed(list(model.named_modules())):
         fully_shard(module)
 
-    dataset = DummyDataset(hidden_size=hidden_size)
+    # 使用最新的 LLMDummyDataset
+    dataset = LLMDummyDataset(vocab_size=vocab_size, seq_len=seq_len)
     sampler = DistributedSampler(dataset, num_replicas=1, rank=0, shuffle=False)
     dataloader = DataLoader(dataset, sampler=sampler, batch_size=8, shuffle=False)
 
@@ -47,24 +51,30 @@ def train(args, local_rank, world_size, device_type="npu"):
         for x, y in dataloader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
+            
             if args.sp_enabled:
+                # 开启 SP 时，切分输入和标签（序列维度 dim 1）
                 inputs = torch.split(x, world_size, dim=1) 
+                labels = torch.split(y, world_size, dim=1)
                 output = model(inputs[local_rank])
+                target = labels[local_rank]
             else:
                 output = model(x)
+                target = y
             
-            # actually the loss of naive and SP one are different, 
-            # sould not use CrossEntropyLoss in SP case
-            loss = loss_fn(output, y)
+            # 这里的 output 形状为 [B, S_shard, H]，target 形状为 [B, S_shard]
+            # CrossEntropyLoss 期望类别维在 dim 1: [B, H, S_shard]
+            loss = loss_fn(output.transpose(1, 2), target)
 
             loss.backward()
             optimizer.step()
         
-        local_loss = loss.detach()
-        dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
+        # 汇总各 Rank 的平均 loss
+        dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+        avg_loss = loss.item() / world_size
 
         if local_rank == 0:
-            print(f"[Rank {local_rank}] Epoch {epoch + 1}, loss: {loss.item():.4f}")
+            print(f"[Rank 0] Epoch {epoch + 1}, loss: {avg_loss:.4f}")
 
 import argparse
 
@@ -93,13 +103,13 @@ if __name__ == "__main__":
     main()
 
 # 
-# [Rank 0] Epoch 1, loss: 1.4148
-# [Rank 0] Epoch 2, loss: 1.3984
-# [Rank 0] Epoch 3, loss: 1.3920
-# [Rank 0] Epoch 4, loss: 1.3906
-# [Rank 0] Epoch 5, loss: 1.3873
-# [Rank 0] Epoch 6, loss: 1.3618
-# [Rank 0] Epoch 7, loss: 1.3281
-# [Rank 0] Epoch 8, loss: 1.2578
-# [Rank 0] Epoch 9, loss: 1.3602
-# [Rank 0] Epoch 10, loss: 1.3301
+# [Rank 0] Epoch 1, loss: 9.2125
+# [Rank 0] Epoch 2, loss: 9.2327
+# [Rank 0] Epoch 3, loss: 9.2289
+# [Rank 0] Epoch 4, loss: 9.2240
+# [Rank 0] Epoch 5, loss: 9.2188
+# [Rank 0] Epoch 6, loss: 9.2162
+# [Rank 0] Epoch 7, loss: 9.2187
+# [Rank 0] Epoch 8, loss: 9.2291
+# [Rank 0] Epoch 9, loss: 9.2184
+# [Rank 0] Epoch 10, loss: 9.2198

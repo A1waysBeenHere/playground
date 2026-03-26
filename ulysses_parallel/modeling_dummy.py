@@ -26,7 +26,7 @@ class Attention(nn.Module):
 
     def forward(self, hidden_states):
         """
-        x: [B, S, hidden_size]
+        hidden_states: [B, S, hidden_size]
         """
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1 , self.head_dim)
@@ -47,9 +47,23 @@ class Attention(nn.Module):
         return out
 
 class DummyModel(nn.Module):
-    def __init__(self, hidden_size, num_heads):
+    def __init__(self, vocab_size, hidden_size, num_heads):
         super().__init__()
+        # 1. 嵌入层：通过词表大小和隐藏维度初始化
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        # 2. 注意力层
         self.attn = Attention(hidden_size, num_heads)
+        # 3. 输出投影层（LM Head）
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, x):
-        return self.attn(x)
+        """
+        x: 输入 Token IDs, 形状 [B, S]
+        """
+        # input_ids -> hidden_states [B, S, H]
+        h = self.embedding(x)
+        # 经过注意力计算 [B, S, H]
+        h = self.attn(h)
+        # 映射回词表空间 [B, S, V]
+        logits = self.lm_head(h)
+        return logits
