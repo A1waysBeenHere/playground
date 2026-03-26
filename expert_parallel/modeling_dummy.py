@@ -1,31 +1,69 @@
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+import os
+import random
+import argparse
+import numpy as np
+import torch, torch_npu
+import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed._composable.fsdp import fully_shard
+from torch.distributed._tensor import DTensor, Shard, Replicate, distribute_tensor
+from typing import Any, List, Optional, Tuple
 
 
-class Expert(nn.Module):
-    """单个专家网络（简单的两层全连接）"""
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.activation = nn.GELU()
+class LLMDummyDataset(torch.utils.data.Dataset):
+    """训练 LLM 用的 dummy 数据集"""
+    def __init__(self, vocab_size: int, seq_len: int = 32, size: int = 100):
+        self.size = size
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-        Args:
-            x: 输入张量，shape [batch_size, seq_len, input_dim]
-        Returns:
-            输出张量，shape [batch_size, seq_len, output_dim]
-        """
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        input_ids = torch.randint(0, self.vocab_size, (self.seq_len,))
+        # LLM 训练通常使用 input_ids 右移一位作为 labels
+        # 此处简化直接生成 dummy labels
+        labels = torch.randint(0, self.vocab_size, (self.seq_len,))
+        return input_ids, labels
+
+
+def print_sharding_info(model: nn.Module):
+    """打印模型参数的切分信息"""
+    if dist.get_rank() != 0:
+        return
+        
+    print("\n" + "="*50)
+    print("模型参数切分状态 (Sharding Status):")
+    print("="*50)
+    
+    for name, param in model.named_parameters():
+        param_type = type(param).__name__
+        
+        # 尝试获取分片信息
+        sharding_desc = "Unknown / Not Sharded"
+        # 使用 isinstance 判断基类，减少静态分析报错
+        if hasattr(param, "placements"):
+             # param: Any (DTensor)
+             sharding_desc = f"DTensor | Placements: {getattr(param, 'placements', 'N/A')}"
+        elif "FlatParameter" in param_type:
+             sharding_desc = "FSDP1 FlatParameter"
+             
+        print(f"Layer: {name:<40} | Type: {param_type:<15}")
+        print(f"  -> {sharding_desc}")
+        # 通过 getattr 规避属性不存在的报错
+        print(f"  -> Total Shape: {list(getattr(param, 'shape', []))}")
+        if hasattr(param, "to_local"):
+            local_tensor = getattr(param, "to_local")()
+            print(f"  -> Local Shape: {list(local_tensor.shape)}")
+        print("-" * 50)
+    print("="*50 + "\n")
+
+
+# 移除旧的 Expert 类，改为在 MoELayer 中直接使用 concat 后的参数
 
 
 class TopKGating(nn.Module):
@@ -70,13 +108,14 @@ class TopKGating(nn.Module):
 
 
 class MoELayer(nn.Module):
-    """MoE层（整合门控和专家网络）"""
+    """MoE层（整合门控和专家网络，支持 Expert Parallel）"""
     def __init__(
         self,
         input_dim: int,
         output_dim: int,
         num_experts: int,
         expert_hidden_dim: int,
+        ep_mesh: Optional[Any] = None, # (dp, ep) mesh
         top_k: int = 2,
         dropout: float = 0.1
     ):
@@ -88,52 +127,50 @@ class MoELayer(nn.Module):
 
         # 1. 初始化门控
         self.gating = TopKGating(input_dim, num_experts, top_k)
-        # 2. 初始化专家网络（用ModuleList管理多个专家）
-        self.experts = nn.ModuleList([
-            Expert(input_dim, expert_hidden_dim, output_dim, dropout)
-            for _ in range(num_experts)
-        ])
+        
+        # 2. 初始化专家网络（将各专家 concat 到同一个 Tensor 中，方便 EP 切分和批量计算）
+        # 形状: [num_experts, input_dim, expert_hidden_dim]
+        self.w1 = nn.Parameter(torch.randn(num_experts, input_dim, expert_hidden_dim))
+        self.w2 = nn.Parameter(torch.randn(num_experts, expert_hidden_dim, output_dim))
+        
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        前向传播：路由输入到Top-K专家，融合专家输出
-        Args:
-            x: 输入张量，shape [batch_size, seq_len, input_dim]
-        Returns:
-            output: 融合后的输出，shape [batch_size, seq_len, output_dim]
-            aux_loss: 负载均衡辅助损失
+        前向传播：利用 concat 后的参数进行批量计算，避免 Python for 循环
         """
         batch_size, seq_len, _ = x.shape
         # 1. 计算门控权重和专家索引
-        gate_scores, expert_indices, aux_loss = self.gating(x)  # [bs, seq, k], [bs, seq, k]
+        gate_scores, expert_indices, aux_loss = self.gating(x) 
         
-        # 2. 展平维度，方便批量处理 [batch_size*seq_len, input_dim]
-        x_flat = x.reshape(-1, self.input_dim)
-        gate_scores_flat = gate_scores.reshape(-1, self.top_k)  # [bs*seq, k]
-        expert_indices_flat = expert_indices.reshape(-1, self.top_k)  # [bs*seq, k]
+        # 2. 展平维度
+        x_flat = x.reshape(-1, self.input_dim) # [tokens, input_dim]
+        gate_scores_flat = gate_scores.reshape(-1, self.top_k) 
+        expert_indices_flat = expert_indices.reshape(-1, self.top_k) 
         
-        # 3. 初始化输出张量
-        output_flat = torch.zeros_like(x_flat)[:, :self.output_dim]
-        
-        # 4. 遍历每个专家，处理分配给它的样本
-        for expert_id, expert in enumerate(self.experts):
-            # 找到所有选择了当前专家的样本索引
-            mask = (expert_indices_flat == expert_id)  # [bs*seq, k]
-            if not mask.any():
-                continue  # 无样本分配给该专家，跳过
+        # 3. 批量计算
+        outputs = []
+        for k in range(self.top_k):
+            indices = expert_indices_flat[:, k] 
+            w1_selected = self.w1[indices]  # [tokens, input_dim, hidden_dim]
+            w2_selected = self.w2[indices]  # [tokens, hidden_dim, output_dim]
             
-            # 提取这些样本的输入和对应的门控权重
-            selected_indices = mask.nonzero()[:, 0]  # 样本索引
-            selected_x = x_flat[selected_indices]
-            selected_scores = gate_scores_flat[mask]
+            # 第一层
+            hidden = torch.bmm(x_flat.unsqueeze(1), w1_selected)
+            hidden = self.activation(hidden)
+            hidden = self.dropout(hidden)
             
-            # 专家处理样本
-            expert_output = expert(selected_x)
-            # 加权融合到输出中
-            output_flat[selected_indices] += selected_scores.unsqueeze(1) * expert_output
+            # 第二层
+            out = torch.bmm(hidden, w2_selected)
+            outputs.append(out.squeeze(1)) # [tokens, output_dim]
+            
+        # 4. 加权融合
+        final_output_flat = torch.zeros_like(x_flat)[:, :self.output_dim]
+        for k in range(self.top_k):
+            final_output_flat += gate_scores_flat[:, k:k+1] * outputs[k]
         
-        # 5. 恢复原始维度
-        output = output_flat.reshape(batch_size, seq_len, self.output_dim)
+        output = final_output_flat.reshape(batch_size, seq_len, self.output_dim)
         return output, aux_loss
 
 
@@ -147,7 +184,7 @@ class MoEModel(nn.Module):
         expert_hidden_dim: int = 1024,
         top_k: int = 2,
         dropout: float = 0.1,
-        num_classes: int = 10  # 分类任务的类别数
+        mesh: Optional[Any] = None  # (dp, ep) mesh
     ):
         super().__init__()
         # 1. 词嵌入层
@@ -159,33 +196,97 @@ class MoEModel(nn.Module):
             num_experts=num_experts,
             expert_hidden_dim=expert_hidden_dim,
             top_k=top_k,
-            dropout=dropout
+            dropout=dropout,
+            ep_mesh=mesh["ep"] if mesh is not None else None
         )
-        # 3. 输出层（分类任务）
-        self.fc_out = nn.Linear(embed_dim, num_classes)
+        # 3. 输出层（LLM 任务：投影回词表大小）
+        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        前向传播
-        Args:
-            input_ids: 输入token索引，shape [batch_size, seq_len]
-        Returns:
-            logits: 分类输出，shape [batch_size, num_classes]
-            total_aux_loss: 负载均衡辅助损失（训练时需要加到主损失中）
-        """
-        # 1. 嵌入层
         x = self.embedding(input_ids)  # [batch_size, seq_len, embed_dim]
         x = self.dropout(x)
         
-        # 2. MoE层
         moe_output, aux_loss = self.moe_layer(x)  # [batch_size, seq_len, embed_dim]
         
-        # 3. 池化（取序列最后一个token或均值，这里用均值）
-        pooled = moe_output.mean(dim=1)  # [batch_size, embed_dim]
-        
-        # 4. 输出层
-        logits = self.fc_out(pooled)  # [batch_size, num_classes]
+        logits = self.lm_head(moe_output)  # [batch_size, seq_len, vocab_size]
         
         return logits, aux_loss
 
+
+
+
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)  
+
+# --- 初始化与并行配置 ---
+vocab_size = 10000
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+local_rank = int(os.environ["LOCAL_RANK"])
+dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+
+# FSDP2 + EP: 定义 2D Device Mesh
+ep_size = 2 if world_size >= 2 else 1
+dp_size = world_size // ep_size
+mesh = init_device_mesh("npu", (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
+
+model = MoEModel(
+    vocab_size=vocab_size,
+    embed_dim=512,
+    num_experts=8,
+    expert_hidden_dim=1024,
+    top_k=2,
+    mesh=mesh
+).to(f"npu:{local_rank}")
+
+print_sharding_info(model.moe_layer)
+fully_shard(model.moe_layer, mesh=mesh["ep"], reshard_after_forward=False)
+# distribute_tensor(model.moe_layer.w1, mesh["ep"], [Shard(0)])
+# distribute_tensor(model.moe_layer.w2, mesh["ep"], [Shard(0)])
+print_sharding_info(model.moe_layer)
+
+for name, module in reversed(list(model.named_modules())):
+    if isinstance(module, (nn.ModuleList, nn.Sequential, nn.ModuleDict)) or "moe_layer" in name:
+        continue
+    fully_shard(module, mesh=mesh["dp"])
+
+
+
+dataset = LLMDummyDataset(vocab_size=vocab_size, seq_len=32, size=100)
+sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+dataloader = DataLoader(dataset, sampler=sampler, batch_size=4, drop_last=True)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+criterion = nn.CrossEntropyLoss()
+
+model.train()
+
+if rank == 0:
+    print(f"启动训练... Vocab: {vocab_size}, World Size: {world_size}")
+
+for epoch in range(5):
+    sampler.set_epoch(epoch)
+    total_loss = 0.0
+    for step, (input_ids, labels) in enumerate(dataloader):
+        input_ids = input_ids.to(f"npu:{local_rank}")
+        labels = labels.to(f"npu:{local_rank}")
+        
+        optimizer.zero_grad()
+        logits, aux_loss = model(input_ids)
+        
+        loss = criterion(logits.view(-1, vocab_size), labels.view(-1))
+        total_step_loss = loss + aux_loss
+        
+        total_step_loss.backward()
+        optimizer.step()
+        total_loss += total_step_loss.item()
+        
+    avg_loss = total_loss / len(dataloader)
+    if rank == 0:
+        print(f"Epoch {epoch} | Average Loss: {avg_loss:.4f}")
+
+if rank == 0:
+    print("训练完成")
