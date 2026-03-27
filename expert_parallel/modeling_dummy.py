@@ -10,7 +10,141 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed._tensor import DTensor, Shard, Replicate, distribute_tensor
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Literal
+
+
+# --- VeOmni EP Helper Functions ---
+
+def all_to_all(group, input, output_split_sizes=None, input_split_sizes=None):
+    """Encapsulates All-to-All communication."""
+    world_size = dist.get_world_size(group=group)
+    if world_size == 1:
+        return input
+
+    input = input.contiguous()
+    if output_split_sizes is None:
+        output = torch.empty_like(input)
+    else:
+        output = torch.empty(size=(sum(output_split_sizes), input.size(1)), dtype=input.dtype, device=input.device)
+    dist.all_to_all_single(
+        output,
+        input,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=group,
+    )
+    return output
+
+
+def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
+    """Permutes tokens according to the routing map."""
+    num_tokens, _ = tokens.shape
+    num_experts = routing_map.shape[0]
+    routing_map = routing_map.bool()
+
+    token_indices = torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
+    sorted_indices = token_indices.masked_select(routing_map)
+    permuted_input = tokens.index_select(0, sorted_indices)
+    return permuted_input, sorted_indices
+
+
+def unpermute(
+    tokens: torch.Tensor,
+    routing_weights: torch.Tensor,
+    hidden_states_shape: torch.Size,
+    permutation_mapping: torch.Tensor,
+    routing_map: torch.Tensor,
+):
+    """Unpermutes tokens and applies weights."""
+    tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
+    tokens = tokens * tokens_weight.unsqueeze(-1)
+    
+    unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=tokens.dtype)
+    unpermuted_tokens.scatter_add_(0, permutation_mapping.unsqueeze(1).expand(-1, hidden_states_shape[-1]), tokens)
+    return unpermuted_tokens
+
+
+def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
+    """Sorts input tensor chunks back by original indices."""
+    input_chunks = torch.split(input, split_sizes.tolist(), dim=0)
+    output = torch.cat([input_chunks[i] for i in sorted_idxs], dim=0)
+    return output
+
+
+def preprocess(expert_mask: torch.Tensor, num_experts: int, ep_group: dist.ProcessGroup):
+    """Calculates split sizes for All-to-All communication."""
+    ep_size = dist.get_world_size(group=ep_group)
+    num_local_experts = num_experts // ep_size
+    rank = dist.get_rank(ep_group)
+    
+    # [num_experts]
+    num_local_tokens_per_expert = expert_mask.to(torch.int).sum(dim=1)
+    
+    # How many tokens this rank sends to each other rank
+    input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1).tolist()
+    
+    # Synchronize tokens per expert across all EP ranks
+    num_global_tokens_per_expert = torch.zeros(
+        ep_size, num_experts, dtype=num_local_tokens_per_expert.dtype, device=num_local_tokens_per_expert.device
+    )
+    dist.all_gather_into_tensor(num_global_tokens_per_expert, num_local_tokens_per_expert, group=ep_group)
+    
+    # How many tokens this rank receives from each other rank
+    start_idx, end_idx = rank * num_local_experts, (rank + 1) * num_local_experts
+    num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, start_idx:end_idx].contiguous()
+    output_splits = num_global_tokens_per_local_expert.sum(dim=1).tolist()
+    
+    # Cumulative sum tokens for local experts
+    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
+    
+    return input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert
+
+
+def token_pre_all2all(hidden_states, expert_mask, num_experts, input_splits, output_splits, num_global_tokens_per_local_expert, ep_group):
+    """Performs permutation and All-to-All dispatch."""
+    hidden_dim = hidden_states.size(-1)
+    hidden_states = hidden_states.reshape(-1, hidden_dim)
+    org_shape = hidden_states.shape
+    
+    permuted_hidden, input_mapping = permute(hidden_states, expert_mask)
+    global_permuted_hidden = all_to_all(ep_group, permuted_hidden, output_splits, input_splits)
+    
+    # Re-sort tokens by local expert index
+    ep_size = dist.get_world_size(group=ep_group)
+    num_local_experts = num_experts // ep_size
+    # Interleave indices to group by LOCAL expert
+    permute_order = torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
+    global_permuted_hidden = sort_chunks_by_idxs(
+        global_permuted_hidden,
+        num_global_tokens_per_local_expert.ravel(),
+        permute_order,
+    )
+    
+    return global_permuted_hidden, input_mapping, org_shape
+
+
+def tokens_post_all2all(expert_outputs, routing_weights, selected_experts, num_experts, input_splits, output_splits, num_global_tokens_per_local_expert, expert_mask, input_mapping, org_shape, ep_group):
+    """Performs All-to-All receive and unpermutation."""
+    ep_size = dist.get_world_size(group=ep_group)
+    num_local_experts = num_experts // ep_size
+    unpermute_order = torch.arange(num_experts).reshape(num_local_experts, -1).T.ravel().tolist()
+    
+    expert_outputs = sort_chunks_by_idxs(
+        expert_outputs,
+        num_global_tokens_per_local_expert.T.ravel(),
+        unpermute_order,
+    )
+    
+    unpermuted_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
+    
+    # Build routing weights matrix for unpermute
+    weights_idx = torch.zeros((org_shape[0], num_experts), dtype=routing_weights.dtype, device=routing_weights.device)
+    weights_idx.scatter_add_(1, selected_experts, routing_weights)
+    
+    result = unpermute(unpermuted_outputs, weights_idx, org_shape, input_mapping, expert_mask)
+    return result
+
+
 
 
 class LLMDummyDataset(torch.utils.data.Dataset):
@@ -108,7 +242,7 @@ class TopKGating(nn.Module):
 
 
 class MoELayer(nn.Module):
-    """MoE层（整合门控和专家网络，支持 Expert Parallel）"""
+    """MoE层（整合门控和专家网络，完全遵循 VeOmni EP 实现逻辑）"""
     def __init__(
         self,
         input_dim: int,
@@ -124,12 +258,21 @@ class MoELayer(nn.Module):
         self.output_dim = output_dim
         self.num_experts = num_experts
         self.top_k = top_k
+        self.ep_mesh = ep_mesh
+        if ep_mesh is not None:
+            self.ep_group = ep_mesh.get_group()
+            self.ep_size = dist.get_world_size(group=self.ep_group)
+        else:
+            self.ep_group = None
+            self.ep_size = 1
+        self.num_local_experts = num_experts // self.ep_size
 
         # 1. 初始化门控
         self.gating = TopKGating(input_dim, num_experts, top_k)
         
-        # 2. 初始化专家网络（将各专家 concat 到同一个 Tensor 中，方便 EP 切分和批量计算）
-        # 形状: [num_experts, input_dim, expert_hidden_dim]
+        # 2. 初始化专家网络
+        # 在 EP 模式下，我们要确保每张卡只负责自己的 local experts
+        # 为了演示，我们先全量初始化，然后在 forward 中根据 EP 分离
         self.w1 = nn.Parameter(torch.randn(num_experts, input_dim, expert_hidden_dim))
         self.w2 = nn.Parameter(torch.randn(num_experts, expert_hidden_dim, output_dim))
         
@@ -137,40 +280,88 @@ class MoELayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        前向传播：利用 concat 后的参数进行批量计算，避免 Python for 循环
-        """
         batch_size, seq_len, _ = x.shape
         # 1. 计算门控权重和专家索引
         gate_scores, expert_indices, aux_loss = self.gating(x) 
         
-        # 2. 展平维度
-        x_flat = x.reshape(-1, self.input_dim) # [tokens, input_dim]
-        gate_scores_flat = gate_scores.reshape(-1, self.top_k) 
-        expert_indices_flat = expert_indices.reshape(-1, self.top_k) 
+        if self.ep_group is None or self.ep_size == 1:
+            # 非 EP 模式：原有逻辑
+            x_flat = x.reshape(-1, self.input_dim)
+            gate_scores_flat = gate_scores.reshape(-1, self.top_k) 
+            expert_indices_flat = expert_indices.reshape(-1, self.top_k) 
+            outputs = []
+            for k in range(self.top_k):
+                indices = expert_indices_flat[:, k] 
+                w1_selected = self.w1[indices]
+                w2_selected = self.w2[indices]
+                hidden = torch.bmm(x_flat.unsqueeze(1), w1_selected)
+                hidden = self.activation(hidden)
+                hidden = self.dropout(hidden)
+                out = torch.bmm(hidden, w2_selected)
+                outputs.append(out.squeeze(1))
+            final_output_flat = torch.zeros_like(x_flat)[:, :self.output_dim]
+            for k in range(self.top_k):
+                final_output_flat += gate_scores_flat[:, k:k+1] * outputs[k]
+            output = final_output_flat.reshape(batch_size, seq_len, self.output_dim)
+            return output, aux_loss
+
+        # --- EP 模式：遵循 VeOmni All-to-All 逻辑 ---
         
-        # 3. 批量计算
-        outputs = []
-        for k in range(self.top_k):
-            indices = expert_indices_flat[:, k] 
-            w1_selected = self.w1[indices]  # [tokens, input_dim, hidden_dim]
-            w2_selected = self.w2[indices]  # [tokens, hidden_dim, output_dim]
-            
-            # 第一层
-            hidden = torch.bmm(x_flat.unsqueeze(1), w1_selected)
-            hidden = self.activation(hidden)
-            hidden = self.dropout(hidden)
-            
-            # 第二层
-            out = torch.bmm(hidden, w2_selected)
-            outputs.append(out.squeeze(1)) # [tokens, output_dim]
-            
-        # 4. 加权融合
-        final_output_flat = torch.zeros_like(x_flat)[:, :self.output_dim]
-        for k in range(self.top_k):
-            final_output_flat += gate_scores_flat[:, k:k+1] * outputs[k]
+        # a. 准备 expert_mask [E, total_tokens]
+        total_tokens = batch_size * seq_len
+        # expert_indices shape: [bs, seq, top_k] -> [total_tokens, top_k]
+        expert_indices_flat = expert_indices.reshape(total_tokens, self.top_k)
+        gate_scores_flat = gate_scores.reshape(total_tokens, self.top_k)
         
-        output = final_output_flat.reshape(batch_size, seq_len, self.output_dim)
+        expert_mask = F.one_hot(expert_indices_flat, num_classes=self.num_experts).sum(dim=1).T # [E, total_tokens]
+        
+        # b. Preprocess (计算 All-to-All split sizes)
+        input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = preprocess(
+            expert_mask, self.num_experts, self.ep_group
+        )
+        
+        # c. Token Pre-All2All (Permute + All-to-All)
+        permuted_tokens, input_mapping, org_shape = token_pre_all2all(
+            x, expert_mask, self.num_experts, input_splits, output_splits, 
+            num_global_tokens_per_local_expert, self.ep_group
+        )
+        
+        # d. Local Expert Execution
+        # 获取本地专家的参数
+        rank = dist.get_rank(self.ep_group)
+        start_idx = rank * self.num_local_experts
+        end_idx = (rank + 1) * self.num_local_experts
+        local_w1 = self.w1[start_idx:end_idx] # [num_local_experts, I, H]
+        local_w2 = self.w2[start_idx:end_idx] # [num_local_experts, H, O]
+        
+        # 按照本地专家分配的 token 数进行 split
+        local_tokens_per_expert = num_global_sum_tokens_per_local_expert.tolist()
+        expert_inputs = torch.split(permuted_tokens, local_tokens_per_expert, dim=0)
+        
+        expert_outputs = []
+        for i, token_chunk in enumerate(expert_inputs):
+            if token_chunk.shape[0] == 0:
+                expert_outputs.append(torch.empty(0, self.output_dim, device=x.device, dtype=x.dtype))
+                continue
+            # 单个专家计算 (模拟 Group Gemm)
+            # local_w1[i] shape: [input_dim, expert_hidden_dim]
+            h = torch.matmul(token_chunk, local_w1[i])
+            h = self.activation(h)
+            h = self.dropout(h)
+            out = torch.matmul(h, local_w2[i])
+            expert_outputs.append(out)
+        
+        combined_expert_outputs = torch.cat(expert_outputs, dim=0)
+        
+        # e. Token Post-All2All (All-to-All + Unpermute)
+        final_hidden_states = tokens_post_all2all(
+            combined_expert_outputs, gate_scores_flat, expert_indices_flat, 
+            self.num_experts, input_splits, output_splits, 
+            num_global_tokens_per_local_expert, expert_mask, 
+            input_mapping, org_shape, self.ep_group
+        )
+        
+        output = final_hidden_states.reshape(batch_size, seq_len, self.output_dim)
         return output, aux_loss
 
 
@@ -242,14 +433,17 @@ model = MoEModel(
     mesh=mesh
 ).to(f"npu:{local_rank}")
 
-print_sharding_info(model.moe_layer)
-fully_shard(model.moe_layer, mesh=mesh["ep"], reshard_after_forward=False)
-# distribute_tensor(model.moe_layer.w1, mesh["ep"], [Shard(0)])
-# distribute_tensor(model.moe_layer.w2, mesh["ep"], [Shard(0)])
-print_sharding_info(model.moe_layer)
+# 根据 VeOmni 逻辑，我们需要对专家参数进行 EP 切分 (Shard 0)
+# 在 FSDP2 中，我们可以直接通过 fully_shard 对 moe_layer 内部的 w1, w2 进行特定维度的切分
+# 但为了更贴合 VeOmni 的模式，我们这里演示对手动管理的 w1, w2 进行 EP 维度的 fully_shard
 
+# 修改：不再直接对 moe_layer 整体做 ep 维度的 fully_shard，因为那会将 gating 也 shard 掉
+# 我们只 shard w1 和 w2
+fully_shard(model.moe_layer, mesh=mesh["ep"], reshard_after_forward=False)
+
+# 对非 MoE 部分做普通的 DP (FSDP)
 for name, module in reversed(list(model.named_modules())):
-    if isinstance(module, (nn.ModuleList, nn.Sequential, nn.ModuleDict)) or "moe_layer" in name:
+    if "moe_layer" in name or isinstance(module, (nn.ModuleList, nn.Sequential, nn.ModuleDict)):
         continue
     fully_shard(module, mesh=mesh["dp"])
 
